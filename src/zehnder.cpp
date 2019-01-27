@@ -1,65 +1,15 @@
-#include <PubSubClient.h>
-#include <Ethernet2.h>
+/* =============================================================================
+   Zehnder.cpp
+   Written in 2018 by Tim Jacobs
+  ============================================================================= */
 
-/* --------------------------------------------------------------------------
-   Definitions
-   -------------------------------------------------------------------------- */
-
-#define OUTPUTSER Serial                  // debug output port
-#define ARDUINO_BAUDRATE 57600            // debug output port baud rate
-
-#define USEMQTT                           // Comment if you want to disable MQTT and only want console logging
-//#define TRACE                           // Dump a lot of data to serial output
-
-/* --------------------------------------------------------------------------
-   Main variables
-   -------------------------------------------------------------------------- */
-
-#ifdef USEMQTT
-// Main network interface
-EthernetClient netClient;
-
-// Network parameters
-byte netMAC[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
-IPAddress netIP(172, 16, 0, 70);
-IPAddress netDNS(171,16,0,1);
-IPAddress netGW(172, 16, 0, 1);
-IPAddress netSubNet(255, 255, 255, 0);
-
-// The IP address of the server we're connecting to:
-IPAddress netMQTTServer(172, 16, 0, 6);
-#define MQTTPORT 1883
-
-// MQTT Client
-PubSubClient mqttClient(netClient);
-long lastReconnectAttempt = 0;
-
-// MQTT Topics
-#define MQTTPUBTOPIC_SYSTEM "ZehnderComfoD450-SYS"             // Publish system messages here
-#define MQTTPUBTOPIC_DATA "ZehnderComfoD450-DATA"           // Publish measurements here
-#define MQTTSUBTOPIC "ZehnderArduino"               // Subscribe here
-
-#endif
-
-/* --------------------------------------------------------------------------
-   Zehnder RS232 related data
-   -------------------------------------------------------------------------- */
-
-#define CACMD_MINLENGTH 8                       // Minimum Zehnder CA command length 
-#define CACMD_MAXLENGTH (uint16_t)(CACMD_MINLENGTH+255)   // Maximum command length; since "data length" is 1 byte in Zehnder command, there can be at most 255 data bytes.
-
-const byte cacmd_StartCMD[] = { 0x07, 0xF0 };
-const byte cacmd_StopCMD[] = { 0x07, 0x0F };
+#include "zehnder.h"
+#include "mqtt.h"
 
 // Zehnder serial definitions
-HardwareSerial& zehnderPort = Serial1;
-//SoftwareSerial zehnderPort(10, 11); // RX, TX
-#define ZEHNDER_BAUDRATE 9600
-#define ZEHNDER_SERIALSETTINGS SERIAL_8N1
+HardwareSerial& zehnderPort = ZEHNDER_PORT;
 
-//
 // Serial buffers
-//
 byte serialBuffer[64];                              // To hold serial data 
 #define PROCESSBUFFERSIZE 2*CACMD_MAXLENGTH
 byte processBuffer[PROCESSBUFFERSIZE];              // Our backlog for processing data
@@ -68,126 +18,34 @@ int processSize = 0;                                // How much data we have in 
 byte cmdBuffer[CMDBUFFERSIZE];                      // Our command buffer for parsing
 int cmdSize = 0;                                    // How much data we have in the cmdBuffer
 
+// ---------------------------------------------------------------------------
+// ZEHNDERINIT
+// ---------------------------------------------------------------------------
+// Prepares serial port for reading
+// ---------------------------------------------------------------------------
 
-
-/* --------------------------------------------------------------------------
-   Misc paraphernalia
-   -------------------------------------------------------------------------- */
-
-void(* SoftReset) (void) = 0; // declare reset function @ address 0
-
-
-/* ===========================================================================
-   ===========================================================================
-   ===========================================================================
-   MAIN SETUP
-   ===========================================================================
-   ===========================================================================
-   =========================================================================== */
-
-void setup() {
-
-      OUTPUTSER.begin(ARDUINO_BAUDRATE);
-      OUTPUTSER.println("");
-      OUTPUTSER.println(F("=== SETUP START ==="));
-
-      // Init serial port reader...
-      OUTPUTSER.println(F("Init Serial port..."));
-      zehnderPort.begin(ZEHNDER_BAUDRATE, SERIAL_8N1 );
-
-      // Initialize MQTT
-#ifdef USEMQTT
-      OUTPUTSER.println(F("Preparing MQTT client..."));
-      mqttClient.setServer(netMQTTServer, MQTTPORT);
-      mqttClient.setCallback(mqttCallback);
-
-      // Initialize network
-      OUTPUTSER.println(F("Init network connection..."));
-      OUTPUTSER.println(F("-> Trying to get an IP address using DHCP"));
-      if (Ethernet.begin(netMAC) == 0) {
-          OUTPUTSER.println(F("-> Failed to configure Ethernet using DHCP; trying static config!"));
-          // initialize the Ethernet device not using DHCP:
-          Ethernet.begin(netMAC, netIP, netDNS, netGW, netSubNet);
-          // Wait until Ethernet client ready
-          OUTPUTSER.print(F("-> Connecting..."));
-          int loopcounter = 0;
-          while(!netClient){
-              // Wait until there is a client connected to proceed
-              delay(250);
-              OUTPUTSER.print(F("."));
-              loopcounter++;
-              if (loopcounter > 120) {
-                  OUTPUTSER.println(); OUTPUTSER.println(F("ERROR! Cannot connect to network; rebooting!"));
-                  delay(2000);
-                  SoftReset();
-              }
-          }
-          OUTPUTSER.println(F(" DONE!"));
-      }
-      
-      // Print our local IP address:
-      OUTPUTSER.print("-> Current IP address: ");
-      netIP = Ethernet.localIP();
-      for (byte thisByte = 0; thisByte < 4; thisByte++) {
-          // print the value of each byte of the IP address:
-          OUTPUTSER.print(netIP[thisByte], DEC);
-          OUTPUTSER.print(".");
-      }
-      OUTPUTSER.println();
-#endif
-      
-      OUTPUTSER.println(F("=== SETUP DONE ==="));
+void zehnderInit() {
+    DEBUGOUT.println(F("Init Zehnder Serial port..."));
+    zehnderPort.begin(ZEHNDER_BAUDRATE, SERIAL_8N1 );
 }
 
+// ---------------------------------------------------------------------------
+// CHECKCOMMAND
+// ---------------------------------------------------------------------------
+// Read new data on Zehnder Port, if any, and verify if we can find a 
+// complete command in our current memory buffers
+// ---------------------------------------------------------------------------
 
-/* ===========================================================================
-   ===========================================================================
-   ===========================================================================
-   MAIN LOOP
-   ===========================================================================
-   ===========================================================================
-   =========================================================================== */
-
-
-
-void loop() {
-
-#ifdef USEMQTT
-    //
-    // DHCP lease refresh?
-    //
-    Ethernet.maintain();
-    
-    //
-    // MQTT still connected?
-    // 
-    if (!mqttClient.connected()) {
-      long now = millis();
-      if (now - lastReconnectAttempt > 5000) {
-        lastReconnectAttempt = now;
-        // Attempt to reconnect
-        if (mqttReconnect()) {
-          lastReconnectAttempt = 0;
-        }
-      }
-    } else {
-      // Check MQTT situation
-      mqttClient.loop();
-    }
- #endif
- 
-    // New data available at the serial port?
+void checkCommand() {
     int bytesToRead = zehnderPort.available();
     if (bytesToRead > 0) {
         // Read data from the serial port
         zehnderPort.readBytes(serialBuffer, bytesToRead);
-
 #ifdef TRACE
         // Output to serial port what we read
-        OUTPUTSER.print("### UART: ");
+        DEBUGOUT.print("### UART: ");
         dumpByteArray(serialBuffer, bytesToRead);
 #endif
-
         int parseoffset = -1;
         int previousparse = 0;
         // Keep looping through old data + new data, as long as we keep on finding commands 
@@ -195,16 +53,16 @@ void loop() {
             previousparse = parseoffset;
             // Check if we have a complete Zehnder command
             parseoffset = checkBuffers(serialBuffer, bytesToRead, previousparse);
-            //OUTPUTSER.print("### PARSEOFFSET: "); OUTPUTSER.println(parseoffset);
+            //DEBUGOUT.print("### PARSEOFFSET: "); DEBUGOUT.println(parseoffset);
 
             // Command found?
             if (cmdSize > 0) {
-                OUTPUTSER.print("### CMDSIZE: ");
-                OUTPUTSER.print(cmdSize);
-                OUTPUTSER.print(" / CMDBUFFER: ");
+                DEBUGOUT.print("### CMDSIZE: ");
+                DEBUGOUT.print(cmdSize);
+                DEBUGOUT.print(" / CMDBUFFER: ");
                 dumpByteArray(cmdBuffer, cmdSize);
                 processCommand();
-           }          
+            }          
         }
         if (previousparse < 0) { previousparse = 0; };
         
@@ -219,53 +77,15 @@ void loop() {
             memcpy(processBuffer+processSize, serialBuffer+previousparse, lengthToStore);
             
             processSize += lengthToStore;
-//            OUTPUTSER.print("### KEEPING: ");
-//            OUTPUTSER.print(lengthToStore);
-//            OUTPUTSER.print(" ### STORESIZE: ");
-//            OUTPUTSER.print(processSize);
-//            OUTPUTSER.print(" / STORE: ");
-//            dumpByteArray(processBuffer, processSize);
+    //      DEBUGOUT.print("### KEEPING: ");
+    //      DEBUGOUT.print(lengthToStore);
+    //      DEBUGOUT.print(" ### STORESIZE: ");
+    //      DEBUGOUT.print(processSize);
+    //      DEBUGOUT.print(" / STORE: ");
+    //      dumpByteArray(processBuffer, processSize);    
         }
     }
 }
-
-/* ===========================================================================
-   ===========================================================================
-   ===========================================================================
-   MQTT COMMUNICATION CODE
-   ===========================================================================
-   ===========================================================================
-   =========================================================================== */
-
-#ifdef USEMQTT
-boolean mqttReconnect() {
-     // Succesfully reconnected
-     OUTPUTSER.print(F("Attempting to connect to MQTT server... "));
-     if (mqttClient.connect("arduinoClient")) {
-        OUTPUTSER.println(F("SUCCESS!"));
-        // Once connected, publish an announcement...
-        mqttClient.publish(MQTTPUBTOPIC_SYSTEM,"Device booted and ready!");
-        // ... and resubscribe
-        mqttClient.subscribe(MQTTSUBTOPIC);
-      } else {
-        OUTPUTSER.println(F("FAILED!"));
-      }
-      return mqttClient.connected();
-}
-
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-    // handle message arrived
-}
-
-#endif
-
-/* ===========================================================================
-   ===========================================================================
-   ===========================================================================
-   ZEHNDER PARSING CODE
-   ===========================================================================
-   ===========================================================================
-   =========================================================================== */
 
 // ---------------------------------------------------------------------------
 // PROCESSCOMMAND
@@ -285,7 +105,7 @@ bool processCommand() {
     String cmdString = byteToHexString(cmdByte2);
     String cmdData = "";
     
-    OUTPUTSER.print(F("CMD = 0x")); OUTPUTSER.print(cmdString);
+    DEBUGOUT.print(F("CMD = 0x")); DEBUGOUT.print(cmdString);
 
     bool parsed = false;
     
@@ -301,25 +121,17 @@ bool processCommand() {
             //       Byte[3] - T2 / Zuluft (°C*)
             //       Byte[4] - T3 / Abluft (°C*)
             //       Byte[5] - T4 / Fortluft (°C*)
-            cmdData = String(getTemperature(cmdBuffer[5])) + "," + String(getTemperature(cmdBuffer[6])) + "," + String(getTemperature(cmdBuffer[7])) + "," + String(getTemperature(cmdBuffer[8])) + "," + String(getTemperature(cmdBuffer[9]));
-            OUTPUTSER.print(F(" ::: Comfort,T1 Outside, T2 To Home, T3 From Home, T4 Exhaust = ")), OUTPUTSER.println(cmdData);
+            cmdData = "t_comfort=" + String(getTemperature(cmdBuffer[5])) + ",t1_intake=" + String(getTemperature(cmdBuffer[6])) + ",t2_tohome=" + String(getTemperature(cmdBuffer[7])) + ",t3_fromhome=" + String(getTemperature(cmdBuffer[8])) + ",t4_exhaust=" + String(getTemperature(cmdBuffer[9]));
+            DEBUGOUT.print(" - "); DEBUGOUT.println(cmdData);
             parsed = true;
             break;
         default :
-            OUTPUTSER.println(F(" - Not parsed"));
+            DEBUGOUT.println(F(" - Not parsed"));
     }
 
-
     if (parsed) {
- #ifdef USEMQTT
-        // Publish data to MQTT queue
-        if (mqttClient.connected()) {
-            String dataOut = String(cmdString + "," + cmdData);      // 
-            char __dataOut[255];
-            dataOut.toCharArray(__dataOut, 255);
-            mqttClient.publish(MQTTPUBTOPIC_DATA,__dataOut);
-        }
-#endif      
+        String dataOut = String("command=" + cmdString + " " + cmdData);
+        mqttPublishData(dataOut);   
     }
     return true;
 }
@@ -494,9 +306,9 @@ int findSequence(byte* dataarray, int datalength, int pos, const byte* sequence,
 
 void dumpByteArray(byte* databuffer, int datalength) {
     for (int i=0; i < datalength; i++) {
-        OUTPUTSER.print(byteToHexString(databuffer[i]));          
+        DEBUGOUT.print(byteToHexString(databuffer[i]));          
     }
-    OUTPUTSER.println();
+    DEBUGOUT.println();
 }
 
 String byteToHexString(char c) {
@@ -508,7 +320,4 @@ String byteToHexString(char c) {
     result[2] = 0x00;
     return String(result);
 }
-
-
-
 
